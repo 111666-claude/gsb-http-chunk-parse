@@ -2,6 +2,7 @@
 package chunked
 
 import (
+	"bytes"
 	"errors"
 	"strconv"
 )
@@ -13,11 +14,19 @@ type Counter struct {
 
 // Decoder 是分块解码器。
 type Decoder struct {
-	buf  []byte
-	pos  int
-	body []byte
-	err  error
+	buf   []byte
+	size  int
+	body  []byte
+	err   error
+	state int
 }
+
+const (
+	stateSize = iota
+	stateData
+	stateTrailer
+	stateDone
+)
 
 // NewDecoder 建一个解码器。
 func NewDecoder() *Decoder {
@@ -36,44 +45,57 @@ func indexCRLF(buf []byte, pos int, c *Counter) int {
 
 // Feed 喂入一段字节。
 func (d *Decoder) Feed(p []byte, c *Counter) error {
-	d.buf = append(d.buf, p...)
-	body := []byte{}
-	pos := 0
-	for pos < len(d.buf) {
-		idx := indexCRLF(d.buf, pos, c)
-		if idx < 0 {
-			break
-		}
-		line := string(d.buf[pos:idx])
-		pos = idx + 2
-		size, err := strconv.Atoi(line)
-		if err != nil {
-			d.err = errors.New("bad-size")
-			return d.err
-		}
-		if size == 0 {
-			for {
-				idx2 := indexCRLF(d.buf, pos, c)
-				if idx2 < 0 {
-					break
-				}
-				line2 := string(d.buf[pos:idx2])
-				pos = idx2 + 2
-				if line2 == "" {
-					break
-				}
-				body = append(body, line2...)
-			}
-			break
-		}
-		end := pos + size
-		if end > len(d.buf) {
-			break
-		}
-		body = append(body, d.buf[pos:end]...)
-		pos = end + 2
+	if d.err != nil {
+		return d.err
 	}
-	d.body = body
+	d.buf = append(d.buf, p...)
+	for d.state != stateDone {
+		switch d.state {
+		case stateSize:
+			idx := indexCRLF(d.buf, 0, c)
+			if idx < 0 {
+				return nil
+			}
+			line := d.buf[:idx]
+			d.buf = d.buf[idx+2:]
+			if i := bytes.IndexByte(line, ';'); i >= 0 {
+				line = line[:i]
+			}
+			n, err := strconv.ParseUint(string(line), 16, 63)
+			if err != nil {
+				d.err = errors.New("bad-size")
+				return d.err
+			}
+			d.size = int(n)
+			if n == 0 {
+				d.state = stateTrailer
+			} else {
+				d.state = stateData
+			}
+		case stateData:
+			if len(d.buf) < d.size+2 {
+				return nil
+			}
+			if d.buf[d.size] != '\r' || d.buf[d.size+1] != '\n' {
+				d.err = errors.New("bad-crlf")
+				return d.err
+			}
+			d.body = append(d.body, d.buf[:d.size]...)
+			d.buf = d.buf[d.size+2:]
+			d.state = stateSize
+		case stateTrailer:
+			idx := indexCRLF(d.buf, 0, c)
+			if idx < 0 {
+				return nil
+			}
+			empty := idx == 0
+			d.buf = d.buf[idx+2:]
+			if empty {
+				d.state = stateDone
+			}
+		}
+	}
+	d.buf = nil
 	return d.err
 }
 
